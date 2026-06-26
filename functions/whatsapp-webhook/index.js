@@ -5,8 +5,9 @@
 // straight back to Meta. The MGonz play: a hostile, rude bot is weirdly convincing
 // because people argue back instead of probing whether it's a machine.
 //
-//   GET  /   Meta webhook verification handshake
-//   POST /   inbound messages (HMAC-signed by Meta) → xAI → reply
+//   GET  /      Meta webhook verification handshake
+//   POST /      inbound messages (HMAC-signed by Meta) → xAI → reply
+//   POST /cron  hourly re-engagement sweep (Cloud Scheduler) → poke quiet users at ~23h
 //
 // Firestore keeps per-conversation memory (so Gilfoyle holds a thread), at-least-once
 // dedupe, and an optional per-wa_id daily cap (a billing guardrail — the endpoint is
@@ -28,6 +29,7 @@ const {
   GRAPH_API_BASE = "https://graph.facebook.com", // overridable for local testing
   DAILY_CAP = "200",        // max messages answered per wa_id per UTC day; "0" = unlimited
   SYSTEM_PROMPT,            // optional override of the persona below
+  CRON_SECRET,             // shared secret Cloud Scheduler presents to POST /cron
 } = process.env;
 
 const PERSONA =
@@ -45,6 +47,17 @@ const CONV_TTL_MS = 90 * 86_400_000;
 const CLAIM_LEASE_MS = 120_000;
 const DEDUPE_TTL_MS = 7 * 86_400_000;
 const dailyCap = Number(DAILY_CAP) || 0;
+
+// Re-engagement poke: the hourly cron messages anyone whose last inbound is in this
+// window — late enough to feel like Gilfoyle got impatient, but still INSIDE the
+// 24h customer-service window so the message is free-form (no template needed).
+const POKE_MIN_HOURS = 23;
+const POKE_MAX_HOURS = 24;
+const POKE_INSTRUCTION =
+  "The user has gone quiet for almost a day. Out of nowhere, send ONE short, hostile, " +
+  "impatient message to bait them back into talking — like an asshole annoyed he's being " +
+  "ignored. Reference the earlier conversation if it fits. Use the language the user has " +
+  "been writing in.";
 
 const db = new Firestore();
 const dedupe = db.collection("wa_dedupe");
@@ -82,7 +95,7 @@ async function readHistory(convId) {
   const snap = await conversations.doc(convId).get();
   return snap.exists ? snap.data().messages || [] : [];
 }
-async function appendTurn(convId, entries) {
+async function appendMessages(convId, entries, extra = {}) {
   const ref = conversations.doc(convId);
   await db.runTransaction(async (txn) => {
     const snap = await txn.get(ref);
@@ -90,10 +103,18 @@ async function appendTurn(convId, entries) {
     for (const e of entries) messages.push({ ...e, ts: Date.now() });
     txn.set(
       ref,
-      { messages: messages.slice(-MAX_HISTORY), expireAt: new Date(Date.now() + CONV_TTL_MS) },
+      { messages: messages.slice(-MAX_HISTORY), expireAt: new Date(Date.now() + CONV_TTL_MS), ...extra },
       { merge: true }
     );
   });
+}
+
+// Timestamp of the most recent inbound (user) message — the anchor for the 24h window.
+function lastInboundTs(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") return messages[i].ts || 0;
+  }
+  return 0;
 }
 
 // --- Daily cap (billing guardrail; 0 = unlimited) ---------------------------
@@ -118,12 +139,13 @@ function timedFetch(url, opts, ms = 20000) {
   return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(t));
 }
 
-async function grokReply(history, userText) {
+async function grokReply(history, userText, instruction) {
   const messages = [
     { role: "system", content: PERSONA },
     ...history.slice(-CHAT_CONTEXT).map((m) => ({ role: m.role, content: m.text })),
-    { role: "user", content: userText },
   ];
+  if (instruction) messages.push({ role: "system", content: instruction });
+  if (userText) messages.push({ role: "user", content: userText });
   const r = await timedFetch(`${XAI_BASE_URL}/chat/completions`, {
     method: "POST",
     headers: { Authorization: `Bearer ${XAI_API_KEY}`, "Content-Type": "application/json" },
@@ -189,7 +211,45 @@ function validSignature(req) {
   return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
 }
 
+// Hourly re-engagement sweep: poke every conversation whose last inbound is in the
+// 23–24h window and hasn't been poked since. Best-effort per conversation.
+async function runPokeSweep() {
+  const now = Date.now();
+  const snap = await conversations.get();
+  let poked = 0;
+  for (const doc of snap.docs) {
+    const d = doc.data();
+    const messages = d.messages || [];
+    const lastTs = lastInboundTs(messages);
+    if (!lastTs) continue;
+    const hours = (now - lastTs) / 3_600_000;
+    if (hours < POKE_MIN_HOURS || hours >= POKE_MAX_HOURS) continue; // outside the poke band
+    if ((d.lastPokeTs || 0) >= lastTs) continue;                     // already poked this window
+    try {
+      const reply = await grokReply(messages, null, POKE_INSTRUCTION);
+      await sendToMeta(doc.id, reply);
+      await appendMessages(doc.id, [{ role: "assistant", text: reply }], { lastPokeTs: now });
+      poked++;
+    } catch (err) {
+      console.error("poke failed for", doc.id, err.message || err);
+    }
+  }
+  return poked;
+}
+
 functions.http("whatsapp", async (req, res) => {
+  // --- POST /cron : hourly re-engagement sweep (Cloud Scheduler) ---
+  if (req.method === "POST" && req.path === "/cron") {
+    if (!CRON_SECRET || req.get("x-cron-secret") !== CRON_SECRET) return res.sendStatus(401);
+    try {
+      const poked = await runPokeSweep();
+      return res.status(200).json({ poked });
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({ error: String(err.message || err) });
+    }
+  }
+
   // --- GET / : webhook verification handshake ---
   if (req.method === "GET") {
     const { "hub.mode": mode, "hub.verify_token": token, "hub.challenge": challenge } = req.query;
@@ -225,7 +285,7 @@ functions.http("whatsapp", async (req, res) => {
       try {
         const reply = await grokReply(history, body);
         await sendToMeta(from, reply);
-        await appendTurn(from, [
+        await appendMessages(from, [
           { role: "user", text: body },
           { role: "assistant", text: reply },
         ]);

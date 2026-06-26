@@ -13,13 +13,19 @@ import crypto from "node:crypto";
 const PROJECT = process.env.GOOGLE_CLOUD_PROJECT || "whatsapp-asst-bripa";
 const APP_SECRET = "test-app-secret";
 const VERIFY_TOKEN = "test-verify-token";
+const CRON_SECRET = "test-cron-secret";
 const FN_PORT = 8088;
 const MOCK_PORT = 9099;
 const FN = `http://127.0.0.1:${FN_PORT}`;
 const CAP = 2;
+const HOUR = 3_600_000;
 
 const WA_A = "10000000001"; // main flow
 const WA_C = "10000000003"; // cap flow
+const WA_P1 = "10000000011"; // poke: in 23-24h band, not yet poked → should poke
+const WA_P2 = "10000000012"; // poke: in band but already poked → skip
+const WA_P3 = "10000000013"; // poke: only 10h quiet → skip
+const POKE_WAS = [WA_P1, WA_P2, WA_P3];
 const DEDUPE_IDS = ["itest.a1", "itest.a2", "itest.c1", "itest.c2", "itest.c3"];
 
 const db = new Firestore({ projectId: PROJECT });
@@ -67,9 +73,22 @@ async function cleanup() {
   const dels = [
     db.collection("conversations").doc(WA_A), db.collection("conversations").doc(WA_C),
     db.collection("ratelimit").doc(WA_A), db.collection("ratelimit").doc(WA_C),
+    ...POKE_WAS.map((id) => db.collection("conversations").doc(id)),
     ...DEDUPE_IDS.map((id) => db.collection("wa_dedupe").doc(id)),
   ];
   for (const d of dels) await d.delete().catch(() => {});
+}
+
+// Seed conversations with crafted timestamps to exercise the poke sweep.
+async function seedPokeConvs() {
+  const now = Date.now();
+  const turn = (userAgoH) => [
+    { role: "user", text: "earlier msg", ts: now - userAgoH * HOUR },
+    { role: "assistant", text: "earlier reply", ts: now - userAgoH * HOUR },
+  ];
+  await db.collection("conversations").doc(WA_P1).set({ messages: turn(23.5) });                       // in band, not poked
+  await db.collection("conversations").doc(WA_P2).set({ messages: turn(23.5), lastPokeTs: now });      // in band, already poked
+  await db.collection("conversations").doc(WA_P3).set({ messages: turn(10) });                         // too recent
 }
 
 async function main() {
@@ -78,7 +97,7 @@ async function main() {
   const ff = spawn("npx", ["--no-install", "functions-framework", "--target=whatsapp", `--port=${FN_PORT}`], {
     cwd: process.cwd(),
     env: { ...process.env,
-      GOOGLE_CLOUD_PROJECT: PROJECT, VERIFY_TOKEN, APP_SECRET,
+      GOOGLE_CLOUD_PROJECT: PROJECT, VERIFY_TOKEN, APP_SECRET, CRON_SECRET,
       WHATSAPP_TOKEN: "test-wa-token", WHATSAPP_PHONE_NUMBER_ID: "PHONE123",
       XAI_API_KEY: "test-xai", XAI_MODEL: "test-grok", XAI_BASE_URL: `http://127.0.0.1:${MOCK_PORT}/v1`,
       GRAPH_API_BASE: `http://127.0.0.1:${MOCK_PORT}`, DAILY_CAP: String(CAP) },
@@ -140,6 +159,26 @@ async function main() {
     s = await stats();
     eq("cap: 3rd over limit → no xAI call", s.chatHits - cb.chatHits, 0);
     eq("cap: 3rd over limit → no Meta send (silent)", s.metaHits - cb.metaHits, 0);
+
+    // re-engagement cron: poke only conversations in the 23-24h band, once per window
+    await seedPokeConvs();
+    eq("cron: wrong secret → 401", (await post("/cron", "{}", { "x-cron-secret": "nope" })).code, 401);
+    let pb = await stats();
+    const cron = await post("/cron", "{}", { "x-cron-secret": CRON_SECRET });
+    eq("cron: → 200", cron.code, 200);
+    eq("cron: poked exactly one conversation", JSON.parse(cron.body).poked, 1);
+    eq("cron: that poke went to Meta", (await stats()).metaHits - pb.metaHits, 1);
+    const p1 = (await db.collection("conversations").doc(WA_P1).get()).data();
+    eq("cron: poked conv got an assistant message appended", p1.messages.length, 3);
+    eq("cron: poked conv has lastPokeTs set", typeof p1.lastPokeTs === "number", true);
+    const p3 = (await db.collection("conversations").doc(WA_P3).get()).data();
+    eq("cron: too-recent conv left untouched", p3.messages.length, 2);
+
+    // second run in the same window must not re-poke
+    pb = await stats();
+    const cron2 = await post("/cron", "{}", { "x-cron-secret": CRON_SECRET });
+    eq("cron: re-run does not re-poke (idempotent per window)", JSON.parse(cron2.body).poked, 0);
+    eq("cron: re-run sends nothing to Meta", (await stats()).metaHits - pb.metaHits, 0);
   } finally {
     ff.kill();
     mock.close();
