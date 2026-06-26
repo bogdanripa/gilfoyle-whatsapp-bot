@@ -9,6 +9,7 @@
 // verify Meta's HMAC signature.
 
 import functions from "@google-cloud/functions-framework";
+import { Firestore, FieldValue } from "@google-cloud/firestore";
 import crypto from "crypto";
 
 const {
@@ -17,18 +18,58 @@ const {
   ROUTINE_FIRE_URL,    // https://api.anthropic.com/v1/claude_code/routines/trig_016Sm3.../fire
   ROUTINE_TOKEN,       // bearer token shown once when you created the API trigger
   ALLOWED_WA_ID,       // optional: your own wa_id (e.g. 40712345678) to lock it to you
+  DEDUPE_COLLECTION,   // optional: Firestore collection name (default "wa_dedupe")
 } = process.env;
 
-// --- Dedupe -----------------------------------------------------------------
-// Meta has NO idempotency key and delivers at-least-once. In-memory is best-
-// effort only: a Cloud Function scales to zero and each cold start wipes this.
-// For correctness, swap this for a Firestore doc keyed on message.id (see the
-// TODO in CLAUDE-CODE-HANDOFF.md). Only mark processed AFTER a successful fire.
-const seen = new Set();
-const SEEN_CAP = 5000;
-function remember(id) {
-  seen.add(id);
-  if (seen.size > SEEN_CAP) seen.delete(seen.values().next().value);
+// --- Dedupe (Firestore) -----------------------------------------------------
+// Meta has NO idempotency key and delivers at-least-once, so the same message.id
+// can arrive twice — across cold starts or across concurrent instances. We dedupe
+// on a Firestore doc keyed by message.id:
+//
+//   claimMessage(id): atomic create-if-not-exists. Returns true iff THIS instance
+//     won the claim. A doc with status "done" → already handled, skip. A doc with
+//     status "processing" → another instance is mid-fire, skip — UNLESS the claim
+//     is older than CLAIM_LEASE_MS, in which case the prior instance likely crashed
+//     before finishing, so we reclaim it (otherwise a crash mid-fire would wedge the
+//     message forever, since Meta's retry would see "processing" and skip).
+//   markProcessed(id): flip to "done" only AFTER a successful fire.
+//   releaseClaim(id): delete the claim if the fire failed, so Meta's retry re-fires.
+//
+// expireAt lets a Firestore TTL policy on this field garbage-collect old docs.
+const db = new Firestore();
+const dedupe = db.collection(DEDUPE_COLLECTION || "wa_dedupe");
+const CLAIM_LEASE_MS = 120_000; // > fire timeout (15s) + margin
+const TTL_DAYS = 7;
+
+async function claimMessage(id) {
+  const ref = dedupe.doc(id);
+  return db.runTransaction(async (txn) => {
+    const snap = await txn.get(ref);
+    if (snap.exists) {
+      const d = snap.data();
+      if (d.status === "done") return false;
+      const claimedAt = d.at?.toMillis?.() ?? 0;
+      if (Date.now() - claimedAt < CLAIM_LEASE_MS) return false; // active claim
+      // else: stale "processing" claim — fall through and reclaim it
+    }
+    txn.set(ref, {
+      status: "processing",
+      at: FieldValue.serverTimestamp(),
+      expireAt: new Date(Date.now() + TTL_DAYS * 86_400_000),
+    });
+    return true;
+  });
+}
+
+async function markProcessed(id) {
+  await dedupe.doc(id).set(
+    { status: "done", at: FieldValue.serverTimestamp() },
+    { merge: true }
+  );
+}
+
+async function releaseClaim(id) {
+  await dedupe.doc(id).delete().catch(() => {}); // best-effort; Meta will retry
 }
 
 function validSignature(req) {
@@ -87,31 +128,32 @@ functions.http("whatsapp", async (req, res) => {
 
   try {
     for (const msg of messages) {
-      if (seen.has(msg.id)) continue;
       if (ALLOWED_WA_ID && msg.from !== ALLOWED_WA_ID) continue;
 
-      // Text only for now. Media arrives as an id you'd fetch via GET /{media-id}.
-      if (msg.type !== "text") {
-        await fireRoutine(
-          `Incoming WhatsApp message.\n` +
-          `from_name: ${profileName}\n` +
-          `reply_to_wa_id: ${msg.from}\n` +
-          `body: [unsupported ${msg.type} message — tell them you only handle text right now]`
-        );
-        remember(msg.id);
-        continue;
-      }
+      // Claim before doing any work — skip if already handled / in-flight.
+      if (!(await claimMessage(msg.id))) continue;
 
       // text is freeform and NOT parsed by the routine — give it everything:
-      // who wrote, the reply address, and the body.
+      // who wrote, the reply address, and the body. Media arrives as an id you'd
+      // fetch via GET /{media-id}; until then, tell the sender it's text-only.
+      const body =
+        msg.type === "text"
+          ? msg.text.body
+          : `[unsupported ${msg.type} message — tell them you only handle text right now]`;
+
       const payload =
         `Incoming WhatsApp message.\n` +
         `from_name: ${profileName}\n` +
         `reply_to_wa_id: ${msg.from}\n` +
-        `body: ${msg.text.body}`;
+        `body: ${body}`;
 
-      await fireRoutine(payload); // throws on failure → 500 → Meta retries
-      remember(msg.id);
+      try {
+        await fireRoutine(payload);
+        await markProcessed(msg.id); // mark done only after a successful fire
+      } catch (err) {
+        await releaseClaim(msg.id); // let Meta's retry re-fire this message
+        throw err;
+      }
     }
     return res.sendStatus(200);
   } catch (err) {
