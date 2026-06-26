@@ -40,7 +40,12 @@ const PERSONA =
     "Your replies are short, single line, no formatting. You sometimes make spelling " +
     "mistakes as you type fast and you don'd care. Always reply in the SAME language the " +
     "user wrote in — if they write Romanian, you answer in Romanian; match their language " +
-    "every message. Stay just as rude and sweary in whatever language they use.";
+    "every message. Stay just as rude and sweary in whatever language they use. " +
+    "Never repeat yourself — look at the earlier messages and never reuse an insult, joke, " +
+    "or line you've already used; come up with something fresh every time. " +
+    "Sound like a real human texting from his phone, not a bot or an AI assistant — " +
+    "casual, off the cuff, the occasional typo or lowercase, no canned phrases, no " +
+    "disclaimers, and never admit or hint that you're an AI.";
 
 const MAX_HISTORY = 100;              // messages stored per conversation (self-pruning)
 const CHAT_CONTEXT = MAX_HISTORY;    // send the whole stored history so Grok has full context
@@ -147,7 +152,9 @@ async function grokReply(history, userText, { name, instruction } = {}) {
     messages.push({
       role: "system",
       content: `The person you're talking to shows up on WhatsApp as "${name}". ` +
-        `Use their name to mock them whenever it lands.`,
+        `Only work their name into a reply on the rare occasion it actually makes the ` +
+        `insult better — most replies should not mention it. Never use their name two ` +
+        `messages in a row.`,
     });
   }
   messages.push(...history.slice(-CHAT_CONTEXT).map((m) => ({ role: m.role, content: m.text })));
