@@ -1,45 +1,36 @@
-# Deploy checklist — whatsapp-webhook
+# Deploy checklist — whatsapp-webhook (Grok / Gilfoyle bot)
 
 Infra already set up (2026-06-26):
 - GCP project **`whatsapp-asst-bripa`** (billing: BofA `01D10F-7A8636-CF2F40`)
 - APIs enabled: cloudfunctions, run, cloudbuild, artifactregistry, firestore, secretmanager
 - Firestore Native DB in `eur3` + TTL on `expireAt` (collection `wa_dedupe`)
 
-See [DESIGN.md](DESIGN.md) for the architecture. Below is the operational sequence.
+See [DESIGN.md](DESIGN.md) for the architecture.
 
-## What lives where (after the mode refactor)
+## Config
 
-**Function-side** (this Cloud Function):
-- env: `VERIFY_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `DEFAULT_MODE=eugene` (optional)
-- secrets: `APP_SECRET`, `SEND_SECRET`, `WHATSAPP_TOKEN`
-- The WhatsApp token now lives ONLY here (the function forwards replies to Meta).
+**Function env:** `VERIFY_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `XAI_MODEL` (optional,
+default `grok-4.3`), `DAILY_CAP` (optional, default 200; `0` = unlimited),
+`SYSTEM_PROMPT` (optional override).
+**Function secrets:** `APP_SECRET`, `WHATSAPP_TOKEN`, `XAI_API_KEY`.
 
-**Firestore** (data-driven, no redeploy to change):
-- `modes/{work,eugene}` — fireUrl + inline routine token + rateLimitPerDay + persona
-- `users/{wa_id}` — mode mapping; absent ⇒ `DEFAULT_MODE`
-- `conversations`, `wa_dedupe`, `ratelimit` — created on first write
+No routines, no skill, no modes — the function talks to xAI and Meta directly.
 
-**Routine-side** (BOTH the work and eugene routines):
-- env: `WHATSAPP_SEND_URL` (function `/send`), `WHATSAPP_SEND_SECRET` (= `SEND_SECRET`)
-- Allowed domains: the function host (`*.cloudfunctions.net`) — NOT graph.facebook.com anymore
-
-## 1. Add the TTL policy for conversations (one-time)
+## 1. Conversations TTL (one-time)
 
 ```bash
 PID=whatsapp-asst-bripa
 gcloud firestore fields ttls update expireAt --collection-group=conversations --enable-ttl --project=$PID --async
 ```
 
-## 2. Create the function secrets
+## 2. Create the secrets
 
 ```bash
 PID=whatsapp-asst-bripa
-printf '%s' 'PASTE_META_APP_SECRET' | gcloud secrets create wa-app-secret  --data-file=- --project=$PID
-printf '%s' 'CHOOSE_A_LONG_RANDOM_STRING' | gcloud secrets create wa-send-secret --data-file=- --project=$PID  # = SEND_SECRET, also goes in routine env
+printf '%s' 'PASTE_META_APP_SECRET' | gcloud secrets create wa-app-secret --data-file=- --project=$PID
 printf '%s' 'PASTE_WHATSAPP_TOKEN' | gcloud secrets create wa-token      --data-file=- --project=$PID
+printf '%s' 'PASTE_XAI_API_KEY'    | gcloud secrets create xai-key       --data-file=- --project=$PID
 ```
-
-(Generate the send secret with `openssl rand -hex 24`.)
 
 ## 3. Deploy
 
@@ -50,12 +41,11 @@ gcloud functions deploy whatsapp-webhook \
   --source=. --entry-point=whatsapp \
   --trigger-http --allow-unauthenticated \
   --project=whatsapp-asst-bripa \
-  --set-env-vars VERIFY_TOKEN=860e10b0a439082a3e36df8ea8e6690bf61d236ad26c45c5,WHATSAPP_PHONE_NUMBER_ID=PASTE_PHONE_NUMBER_ID,DEFAULT_MODE=eugene \
-  --set-secrets APP_SECRET=wa-app-secret:latest,SEND_SECRET=wa-send-secret:latest,WHATSAPP_TOKEN=wa-token:latest
+  --set-env-vars VERIFY_TOKEN=860e10b0a439082a3e36df8ea8e6690bf61d236ad26c45c5,WHATSAPP_PHONE_NUMBER_ID=PASTE_PHONE_NUMBER_ID,XAI_MODEL=grok-4.3,DAILY_CAP=200 \
+  --set-secrets APP_SECRET=wa-app-secret:latest,WHATSAPP_TOKEN=wa-token:latest,XAI_API_KEY=xai-key:latest
 ```
 
-VERIFY_TOKEN above was pre-generated. `--allow-unauthenticated` is required (Meta + the
-routine call publicly); HMAC (inbound) and `SEND_SECRET` (`/send`) are what secure it.
+`--allow-unauthenticated` is required (Meta calls publicly); the HMAC signature check secures it.
 
 ## 4. Grant the runtime SA Firestore + Secret access
 
@@ -67,47 +57,20 @@ gcloud projects add-iam-policy-binding $PID --member="serviceAccount:$SA" --role
 gcloud projects add-iam-policy-binding $PID --member="serviceAccount:$SA" --role=roles/secretmanager.secretAccessor
 ```
 
-## 5. Get the function URL
+## 5. Point Meta at the function
 
 ```bash
 gcloud functions describe whatsapp-webhook --region=europe-central2 --project=whatsapp-asst-bripa --format='value(url)'
 ```
-- Meta callback URL = that URL (the root)
-- `WHATSAPP_SEND_URL` (routine env) = that URL + `/send`
-
-## 6. Create the two routines (claude.ai/code)
-
-- **Work routine** = your existing `trig_016Sm3srSGs8mk73hBVWWVJi` (keeps Gmail/Drive/etc.).
-- **Eugene routine** = a NEW routine with **no connectors** (the isolation boundary).
-- Both: point at this repo (for the whatsapp-send skill); set env `WHATSAPP_SEND_URL`,
-  `WHATSAPP_SEND_SECRET`; add the function host to Allowed domains.
-- Routine prompt (both can share): *"Read the incoming WhatsApp message (it includes any
-  persona, the conversation so far, and the new message). Do what it asks within your
-  abilities, then send exactly one reply with the whatsapp-send skill:
-  `./whatsapp-send.sh <reply_to_wa_id> "<reply>"`."* The Eugene character comes from the
-  mode's `persona` field, injected by the function — no need to bake it into the routine.
-
-## 7. Seed the Firestore mode config
-
-```bash
-cd functions/whatsapp-webhook
-GOOGLE_CLOUD_PROJECT=whatsapp-asst-bripa \
-WORK_FIRE_URL='https://api.anthropic.com/v1/claude_code/routines/trig_016Sm3srSGs8mk73hBVWWVJi/fire' \
-WORK_TOKEN='PASTE_WORK_ROUTINE_TOKEN' \
-EUGENE_FIRE_URL='https://api.anthropic.com/v1/claude_code/routines/trig_<EUGENE>/fire' \
-EUGENE_TOKEN='PASTE_EUGENE_ROUTINE_TOKEN' \
-WORK_WA_ID='PASTE_YOUR_WA_ID' \
-node scripts/seed.mjs
-```
-
-## 8. Point Meta at the function
-
 Meta App → WhatsApp → Configuration → Webhook:
-- Callback URL = function URL (root)
+- Callback URL = that URL
 - Verify token = `860e10b0a439082a3e36df8ea8e6690bf61d236ad26c45c5`
 - Subscribe to the **messages** field
 
-## 9. Confirm
-- From your number → routed to **work** mode → Claude (with your connectors) replies.
-- From any other number → **eugene** mode → chatty persona, no access to your stuff, capped/day.
-- Logs: `gcloud functions logs read whatsapp-webhook --region=europe-central2 --project=whatsapp-asst-bripa --limit=50`
+## 6. Confirm
+Message the WhatsApp Business number → Grok-as-Gilfoyle insults you back.
+Logs: `gcloud functions logs read whatsapp-webhook --region=europe-central2 --project=whatsapp-asst-bripa --limit=50`
+
+## Values still needed from you
+`APP_SECRET`, `WHATSAPP_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID` (Meta), and `XAI_API_KEY` (xAI console).
+`VERIFY_TOKEN` is pre-generated above. Verify `XAI_MODEL` against https://docs.x.ai/docs/models.

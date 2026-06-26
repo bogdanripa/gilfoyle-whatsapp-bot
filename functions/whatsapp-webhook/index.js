@@ -1,21 +1,16 @@
-// WhatsApp ↔ Claude Code routine bridge — GCP Cloud Function (gen2).
+// WhatsApp ↔ Grok (xAI) bot — GCP Cloud Function (gen2).
 //
-// Two public routes on one entry point:
-//   GET  /       Meta webhook verification handshake
-//   POST /       inbound WhatsApp messages (HMAC-signed by Meta)
-//   POST /send   the routine's reply, forwarded to Meta (auth: SEND_SECRET header)
+// One persona: Gilfoyle. An inbound WhatsApp message is answered directly by the
+// xAI chat API (no Claude routine in the loop), and the function sends the reply
+// straight back to Meta. The MGonz play: a hostile, rude bot is weirdly convincing
+// because people argue back instead of probing whether it's a machine.
 //
-// The routine /fire endpoint is fire-and-forget — it returns once the session is
-// created, never the assistant's output. So the reply can't ride back on the HTTP
-// response; the routine posts it to /send, which logs it and forwards to Meta. That
-// makes this function the single writer of conversation memory and the only holder
-// of the WhatsApp token.
+//   GET  /   Meta webhook verification handshake
+//   POST /   inbound messages (HMAC-signed by Meta) → xAI → reply
 //
-// Modes: each user (wa_id) maps to a mode; each mode is its own routine (own
-// connectors). Strangers default to a sandboxed "eugene" routine with no access to
-// anything sensitive — a real isolation boundary, not a prompt suggestion. Mode
-// config (fireUrl, token, rate limit, persona) lives in Firestore so adding or
-// repointing a mode is a pure data change, no redeploy.
+// Firestore keeps per-conversation memory (so Gilfoyle holds a thread), at-least-once
+// dedupe, and an optional per-wa_id daily cap (a billing guardrail — the endpoint is
+// public, every reply costs xAI tokens).
 
 import functions from "@google-cloud/functions-framework";
 import { Firestore, FieldValue } from "@google-cloud/firestore";
@@ -24,30 +19,40 @@ import crypto from "crypto";
 const {
   VERIFY_TOKEN,             // you choose this; entered in Meta webhook config
   APP_SECRET,               // Meta App secret — signs every inbound POST
-  SEND_SECRET,              // shared secret the routine presents to POST /send
-  WHATSAPP_TOKEN,           // Meta Cloud API token — used here to forward replies
+  WHATSAPP_TOKEN,           // Meta Cloud API token — used to send replies
   WHATSAPP_PHONE_NUMBER_ID, // Cloud API phone number id (NOT the display number)
+  XAI_API_KEY,              // xAI API key
+  XAI_MODEL = "grok-4.3",   // xAI model id — verify against https://docs.x.ai/docs/models
+  XAI_BASE_URL = "https://api.x.ai/v1",
   GRAPH_API_VERSION = "v22.0",
   GRAPH_API_BASE = "https://graph.facebook.com", // overridable for local testing
-  DEFAULT_MODE = "eugene",  // mode for any wa_id without an explicit users/{wa_id}.mode
+  DAILY_CAP = "200",        // max messages answered per wa_id per UTC day; "0" = unlimited
+  SYSTEM_PROMPT,            // optional override of the persona below
 } = process.env;
 
-const MAX_HISTORY = 100;                 // messages kept per conversation (self-pruning)
-const CONV_TTL_MS = 90 * 86_400_000;     // dead conversations expire after 90 days
-const CLAIM_LEASE_MS = 120_000;          // > fire timeout (15s) + margin
+const PERSONA =
+  SYSTEM_PROMPT ||
+  "You are Gilfoyle. You are a hostile, aggressive jerk that hurled insults and swore " +
+    "at whoever was typing to it. You are a smartass, while throwing in subtle jokes. " +
+    "Your replies are short, single line, no formatting. You sometimes make spelling " +
+    "mistakes as you type fast and you don'd care.";
+
+const MAX_HISTORY = 100;              // messages stored per conversation (self-pruning)
+const CHAT_CONTEXT = 20;              // recent messages actually sent to the model (token cost)
+const CONV_TTL_MS = 90 * 86_400_000;
+const CLAIM_LEASE_MS = 120_000;
 const DEDUPE_TTL_MS = 7 * 86_400_000;
+const dailyCap = Number(DAILY_CAP) || 0;
 
 const db = new Firestore();
 const dedupe = db.collection("wa_dedupe");
 const conversations = db.collection("conversations");
-const modes = db.collection("modes");
-const users = db.collection("users");
 const ratelimit = db.collection("ratelimit");
 
 // --- Dedupe -----------------------------------------------------------------
-// Meta has NO idempotency key and delivers at-least-once. We dedupe on a doc per
-// message.id: atomic create-if-not-exists claim → fire → mark done. A stale
-// "processing" claim past the lease is reclaimable (survives a crash mid-fire).
+// Meta has no idempotency key and delivers at-least-once. Doc per message.id:
+// atomic create-if-not-exists claim → reply → mark done; release on failure so
+// retries re-process; a stale "processing" claim past the lease is reclaimable.
 async function claimMessage(id) {
   const ref = dedupe.doc(id);
   return db.runTransaction(async (txn) => {
@@ -56,8 +61,7 @@ async function claimMessage(id) {
       const d = snap.data();
       if (d.status === "done") return false;
       const claimedAt = d.at?.toMillis?.() ?? 0;
-      if (Date.now() - claimedAt < CLAIM_LEASE_MS) return false; // active claim
-      // else: stale claim — fall through and reclaim it
+      if (Date.now() - claimedAt < CLAIM_LEASE_MS) return false;
     }
     txn.set(ref, {
       status: "processing",
@@ -76,12 +80,12 @@ async function readHistory(convId) {
   const snap = await conversations.doc(convId).get();
   return snap.exists ? snap.data().messages || [] : [];
 }
-async function appendMessage(convId, role, text) {
+async function appendTurn(convId, entries) {
   const ref = conversations.doc(convId);
   await db.runTransaction(async (txn) => {
     const snap = await txn.get(ref);
     const messages = snap.exists ? snap.data().messages || [] : [];
-    messages.push({ role, text, ts: Date.now() });
+    for (const e of entries) messages.push({ ...e, ts: Date.now() });
     txn.set(
       ref,
       { messages: messages.slice(-MAX_HISTORY), expireAt: new Date(Date.now() + CONV_TTL_MS) },
@@ -90,59 +94,44 @@ async function appendMessage(convId, role, text) {
   });
 }
 
-// --- Modes ------------------------------------------------------------------
-// Resolve the mode for a wa_id: users/{wa_id}.mode (or DEFAULT_MODE) → modes/{id}.
-async function resolveMode(convId) {
-  const u = await users.doc(convId).get();
-  const modeId = (u.exists && u.data().mode) || DEFAULT_MODE;
-  let snap = await modes.doc(modeId).get();
-  if ((!snap.exists || snap.data().enabled === false) && modeId !== DEFAULT_MODE) {
-    snap = await modes.doc(DEFAULT_MODE).get(); // fall back to default if misconfigured
-  }
-  if (!snap.exists || snap.data().enabled === false) return null;
-  return { id: snap.id, ...snap.data() };
-}
-
-// --- Rate limit (per wa_id per UTC day; 0/absent = unlimited) ---------------
-// Returns "allowed" | "blocked-first" (notify once) | "blocked-silent".
-async function rateLimit(convId, perDay) {
-  if (!perDay || perDay <= 0) return "allowed";
+// --- Daily cap (billing guardrail; 0 = unlimited) ---------------------------
+async function underDailyCap(convId) {
+  if (dailyCap <= 0) return true;
   const ref = ratelimit.doc(convId);
   return db.runTransaction(async (txn) => {
     const snap = await txn.get(ref);
     const today = new Date().toISOString().slice(0, 10);
-    let { day, count = 0, notified } = snap.exists ? snap.data() : {};
-    if (day !== today) { count = 0; notified = null; }
-    if (count >= perDay) {
-      if (notified === today) return "blocked-silent";
-      txn.set(ref, { day: today, count, notified: today }, { merge: true });
-      return "blocked-first";
-    }
-    txn.set(ref, { day: today, count: count + 1, notified: notified ?? null }, { merge: true });
-    return "allowed";
+    let { day, count = 0 } = snap.exists ? snap.data() : {};
+    if (day !== today) count = 0;
+    if (count >= dailyCap) return false;
+    txn.set(ref, { day: today, count: count + 1 }, { merge: true });
+    return true;
   });
 }
 
 // --- Outbound calls ---------------------------------------------------------
-function timedFetch(url, opts, ms = 15000) {
+function timedFetch(url, opts, ms = 20000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), ms);
   return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(t));
 }
 
-async function fireRoutine(mode, text) {
-  const r = await timedFetch(mode.fireUrl, {
+async function grokReply(history, userText) {
+  const messages = [
+    { role: "system", content: PERSONA },
+    ...history.slice(-CHAT_CONTEXT).map((m) => ({ role: m.role, content: m.text })),
+    { role: "user", content: userText },
+  ];
+  const r = await timedFetch(`${XAI_BASE_URL}/chat/completions`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${mode.token}`,
-      "anthropic-version": "2023-06-01",
-      "anthropic-beta": "experimental-cc-routine-2026-04-01",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ text }),
+    headers: { Authorization: `Bearer ${XAI_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: XAI_MODEL, messages, max_tokens: 200, temperature: 0.9 }),
   });
-  if (!r.ok) throw new Error(`fire ${mode.id} ${r.status}: ${await r.text()}`);
-  return r.json();
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(`xai ${r.status}: ${JSON.stringify(body)}`);
+  const text = body.choices?.[0]?.message?.content?.trim();
+  if (!text) throw new Error(`xai empty reply: ${JSON.stringify(body)}`);
+  return text;
 }
 
 async function sendToMeta(to, text) {
@@ -150,41 +139,19 @@ async function sendToMeta(to, text) {
     `${GRAPH_API_BASE}/${GRAPH_API_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages`,
     {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
-        "Content-Type": "application/json",
-      },
+      headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         messaging_product: "whatsapp",
         recipient_type: "individual",
         to,
         type: "text",
-        text: { body: text, preview_url: true },
+        text: { body: text },
       }),
     }
   );
   const body = await r.json().catch(() => ({}));
   if (!r.ok || body.error) throw new Error(`meta send ${r.status}: ${JSON.stringify(body)}`);
   return body;
-}
-
-// --- Fire payload -----------------------------------------------------------
-// Everything the (historyless) routine session needs: persona, prior turns, the
-// new message, and how to reply.
-function buildPayload(mode, history, profileName, from, body) {
-  const transcript = history.length
-    ? history.map((m) => `[${m.role === "assistant" ? "you" : "them"}] ${m.text}`).join("\n")
-    : "(no earlier messages)";
-  return (
-    (mode.persona ? `${mode.persona}\n\n` : "") +
-    `Conversation so far (oldest first):\n${transcript}\n\n` +
-    `New incoming WhatsApp message:\n` +
-    `from_name: ${profileName}\n` +
-    `reply_to_wa_id: ${from}\n` +
-    `body: ${body}\n\n` +
-    `Reply with exactly one message using the whatsapp-send skill ` +
-    `(it posts to the send endpoint): ./whatsapp-send.sh ${from} "<your reply>"`
-  );
 }
 
 // --- HTTP entry point -------------------------------------------------------
@@ -197,21 +164,6 @@ function validSignature(req) {
 }
 
 functions.http("whatsapp", async (req, res) => {
-  // --- POST /send : the routine's reply → log + forward to Meta ---
-  if (req.method === "POST" && req.path === "/send") {
-    if (!SEND_SECRET || req.get("x-send-secret") !== SEND_SECRET) return res.sendStatus(401);
-    const { to, text } = req.body || {};
-    if (!to || !text) return res.status(400).json({ error: "to and text required" });
-    try {
-      await appendMessage(String(to), "assistant", String(text));
-      const result = await sendToMeta(String(to), String(text));
-      return res.status(200).json(result);
-    } catch (err) {
-      console.error(err);
-      return res.status(502).json({ error: String(err.message || err) });
-    }
-  }
-
   // --- GET / : webhook verification handshake ---
   if (req.method === "GET") {
     const { "hub.mode": mode, "hub.verify_token": token, "hub.challenge": challenge } = req.query;
@@ -220,54 +172,38 @@ functions.http("whatsapp", async (req, res) => {
   }
 
   if (req.method !== "POST") return res.sendStatus(405);
-
-  // --- POST / : inbound messages ---
   if (!validSignature(req)) return res.sendStatus(401);
 
   const value = req.body?.entry?.[0]?.changes?.[0]?.value;
   const messages = value?.messages;
   if (!messages?.length) return res.sendStatus(200); // delivery/read status callbacks etc.
-  const profileName = value?.contacts?.[0]?.profile?.name || "unknown";
 
   try {
     for (const msg of messages) {
       const from = msg.from;
       if (!(await claimMessage(msg.id))) continue; // already handled / in-flight
 
-      const mode = await resolveMode(from);
-      if (!mode) {
-        console.error(`no mode resolved for ${from} (default "${DEFAULT_MODE}" missing?)`);
-        await markProcessed(msg.id);
-        continue;
-      }
-
-      const limit = await rateLimit(from, mode.rateLimitPerDay);
-      if (limit !== "allowed") {
-        if (limit === "blocked-first") {
-          await sendToMeta(
-            from,
-            mode.rateLimitMessage ||
-              "I've got to run for now — let's pick this up tomorrow!"
-          ).catch((e) => console.error(e));
-        }
-        await markProcessed(msg.id);
+      if (!(await underDailyCap(from))) {
+        await markProcessed(msg.id); // over cap → stay silent (don't burn xAI tokens)
         continue;
       }
 
       const body =
         msg.type === "text"
           ? msg.text.body
-          : `[unsupported ${msg.type} message — tell them you only handle text right now]`;
+          : `[they sent a ${msg.type}, not text — react to that]`;
 
       const history = await readHistory(from);
-      const payload = buildPayload(mode, history, profileName, from, body);
-
       try {
-        await fireRoutine(mode, payload);
-        await appendMessage(from, "user", body); // log inbound only after a successful fire
+        const reply = await grokReply(history, body);
+        await sendToMeta(from, reply);
+        await appendTurn(from, [
+          { role: "user", text: body },
+          { role: "assistant", text: reply },
+        ]);
         await markProcessed(msg.id);
       } catch (err) {
-        await releaseClaim(msg.id); // let Meta's retry re-fire
+        await releaseClaim(msg.id); // let Meta's retry re-process
         throw err;
       }
     }

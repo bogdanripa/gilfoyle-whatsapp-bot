@@ -1,57 +1,33 @@
 # Architecture
 
-Two-way WhatsApp assistant. You (and anyone else) message a WhatsApp Business number;
-a Claude Code **routine** generates the reply. A GCP Cloud Function is the bridge.
-
-## The constraint that shapes everything
-
-The routine `/fire` endpoint is **fire-and-forget** — it returns once the session is
-created, never the assistant's output, and every fire is a **fresh session with no
-history**. Consequences:
-
-1. The reply can't ride back on the HTTP response → the routine sends it out itself,
-   by POSTing to the function's `/send` route.
-2. The routine remembers nothing between messages → the function injects prior turns
-   into each fire, from a transcript it keeps in Firestore.
+A WhatsApp bot with one persona: **Gilfoyle** (the MGonz play — a rude, hostile bot is
+oddly convincing because people argue back instead of probing whether it's a machine).
+A single GCP Cloud Function receives the message, asks **xAI (Grok)** for a reply, and
+sends it straight back to Meta. No Claude routine, no LLM-side quota to worry about —
+just an API call billed per token.
 
 ## Flow
 
 ```
-INBOUND   WhatsApp → Meta → Function POST /:
-  verify HMAC → dedupe (wa_dedupe) → resolve mode (users → modes)
-  → rate-limit check (capped modes) → read history (conversations)
-  → fire mode.fireUrl with (persona + history + new message)
-  → on success: log inbound + mark done | on failure: release claim (Meta retries)
-
-OUTBOUND  Routine → Function POST /send  {to, text}  (x-send-secret header):
-  → log assistant reply (conversations) → forward to Meta Graph API
+WhatsApp → Meta → Function POST /:
+  verify HMAC → dedupe (wa_dedupe) → daily-cap check (ratelimit)
+  → read history (conversations) → xAI chat/completions (system=Gilfoyle + last 20 turns + new msg)
+  → send reply to Meta Graph API → log the turn (user + assistant)
+  → mark done | on failure: release claim so Meta's retry re-processes
 ```
 
-The function is the single writer of memory and the only holder of the WhatsApp token.
+Everything is synchronous within the one request (Grok is fast; well inside Meta's
+webhook timeout). The function is the only thing holding the WhatsApp + xAI keys.
 
-## Modes (per-user behaviour + the isolation boundary)
+## LLM
 
-Each `wa_id` maps to a **mode**; each mode is **its own routine**. This is a real
-security boundary, not a prompt switch: a stranger's message can only reach the
-`eugene` routine, which has **no connectors** — nothing of yours to access even if the
-prompt is fully hijacked. Your number maps to `work` (Gmail, Drive, brokerage, …).
+xAI is OpenAI-compatible: `POST {XAI_BASE_URL}/chat/completions` with
+`Authorization: Bearer {XAI_API_KEY}`, body `{ model, messages:[{role,content}], … }`,
+reply at `choices[0].message.content`. Grok is used (over Claude) because it's far less
+likely to refuse the hostile persona. Model id is env-configurable (`XAI_MODEL`,
+default `grok-4.3`) — verify against https://docs.x.ai/docs/models.
 
-Mode config lives in Firestore so adding/repointing a mode is a data change, no redeploy:
-
-```
-modes/{id}
-  fireUrl          routine /fire endpoint
-  token            routine bearer token (inline — see trade-off note)
-  rateLimitPerDay  0 = unlimited (work); N = cap per wa_id per UTC day (eugene)
-  persona          text prepended to every fire (e.g. Eugene's character)
-  rateLimitMessage one-a-day brush-off sent when a capped user is over limit
-  enabled
-users/{wa_id}      → { mode }            absent ⇒ config/app.defaultMode (env DEFAULT_MODE)
-```
-
-**Token trade-off (chosen):** the routine bearer token is stored inline in the mode doc
-for full data-driven simplicity. Firestore is IAM-protected but not an encrypted secret
-store, so the token is plaintext at rest. Accepted deliberately for this personal setup.
+The persona is the system message (env `SYSTEM_PROMPT`, else the built-in Gilfoyle text).
 
 ## Memory
 
@@ -61,33 +37,29 @@ conversations/{wa_id}
   expireAt:  now + 90d                                    TTL drops dead conversations
 ```
 
-One doc per conversation, capped array. The cap *is* the cleanup — no cron, no batch
-deletes. A round-trip is ~2 reads + 2 writes, against Firestore's free 50k reads / 20k
-writes **per day**. Free forever for a personal assistant.
+Stored verbatim so Gilfoyle holds a thread; the last 20 turns are sent to the model
+(`CHAT_CONTEXT`) to bound token cost. One doc per conversation, capped array — the cap
+*is* the cleanup. Comfortably inside Firestore's free tier.
 
 ## Dedupe
 
-Meta has no idempotency key and delivers at-least-once. `wa_dedupe/{message.id}`:
-atomic create-if-not-exists claim → fire → mark done; release on failure so retries
-re-fire; a stale `processing` claim past the lease is reclaimable (survives a crash
-mid-fire). 7-day TTL.
+Meta delivers at-least-once with no idempotency key. `wa_dedupe/{message.id}`: atomic
+create-if-not-exists claim → reply → mark done; release on failure so retries
+re-process; stale `processing` claims past the lease are reclaimable. 7-day TTL.
 
-## Rate limiting
+## Daily cap (billing guardrail)
 
-`ratelimit/{wa_id}` `{ day, count, notified }`, reset per UTC day. Over the cap →
-one brush-off message that day, then silent. Protects your routine run-quota from
-strangers/spam (each fire is a full cloud session).
+The endpoint is public by design (anyone can argue with Gilfoyle), and every reply
+costs xAI tokens. `ratelimit/{wa_id}` `{day,count}` caps answers per wa_id per UTC day
+(`DAILY_CAP`, default 200; set `0` to disable). Over the cap → silent (no model call,
+no send). This bounds runaway spend without a hard product ceiling.
 
 ## Components
 
-- `functions/whatsapp-webhook/index.js` — the bridge (verify / inbound / `/send`).
-- `functions/whatsapp-webhook/scripts/seed.mjs` — seed mode + user docs.
-- `functions/whatsapp-webhook/test/run.mjs` — 20-check integration test (live Firestore,
-  mocked routine + Meta). `npm test`.
-- `.claude/skills/whatsapp-send/` — skill the routine uses to POST `/send`.
+- `functions/whatsapp-webhook/index.js` — the whole bot (verify / inbound / xAI / send).
+- `functions/whatsapp-webhook/test/run.mjs` — 17-check integration test (live Firestore,
+  mocked xAI + Meta). `npm test`.
 
 ## Known follow-ups
-- **Media** — handle image/audio/document (fetch via `GET /{media-id}`).
-- **Hybrid for chattiness** — answer trivial Eugene turns straight from the function via
-  the Messages API instead of spinning a routine, to save quota.
-- **Outbound templates** — for scheduled pushes outside the 24h window.
+- **Media** — currently non-text messages get a placeholder; could fetch + transcribe.
+- **Outbound templates** — only needed if we ever push unprompted outside the 24h window.
