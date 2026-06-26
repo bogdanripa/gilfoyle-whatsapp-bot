@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
 # Usage: ./whatsapp-send.sh <reply_to_wa_id> "message text"
-# Reads WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID from the environment.
+#
+# Posts the reply to the bridge function's /send route, which logs it to the
+# conversation history and forwards it to the Meta Cloud API. This keeps the
+# WhatsApp token in the function only — the routine never touches it.
+#
+# Reads from the routine environment:
+#   WHATSAPP_SEND_URL — the function's /send endpoint (…/whatsapp-webhook/send)
+#   WHATSAPP_SEND_SECRET — shared secret the function checks (x-send-secret header)
 set -euo pipefail
 
 TO="${1:?usage: whatsapp-send.sh <wa_id> <text>}"
 TEXT="${2:?usage: whatsapp-send.sh <wa_id> <text>}"
 
-: "${WHATSAPP_TOKEN:?WHATSAPP_TOKEN not set}"
-: "${WHATSAPP_PHONE_NUMBER_ID:?WHATSAPP_PHONE_NUMBER_ID not set}"
+: "${WHATSAPP_SEND_URL:?WHATSAPP_SEND_URL not set}"
+: "${WHATSAPP_SEND_SECRET:?WHATSAPP_SEND_SECRET not set}"
 
-# Build the JSON body safely (handles quotes/newlines in TEXT) via a heredoc + jq.
-BODY="$(jq -n --arg to "$TO" --arg text "$TEXT" '{
-  messaging_product: "whatsapp",
-  recipient_type: "individual",
-  to: $to,
-  type: "text",
-  text: { body: $text, preview_url: true }
-}')"
+# Build the JSON body safely (handles quotes/newlines in TEXT) via jq.
+BODY="$(jq -n --arg to "$TO" --arg text "$TEXT" '{to: $to, text: $text}')"
 
-RESP="$(curl -s -X POST \
-  "https://graph.facebook.com/v22.0/${WHATSAPP_PHONE_NUMBER_ID}/messages" \
-  -H "Authorization: Bearer ${WHATSAPP_TOKEN}" \
+RESP="$(curl -s -X POST "$WHATSAPP_SEND_URL" \
+  -H "x-send-secret: ${WHATSAPP_SEND_SECRET}" \
   -H "Content-Type: application/json" \
   -d "$BODY")"
 
