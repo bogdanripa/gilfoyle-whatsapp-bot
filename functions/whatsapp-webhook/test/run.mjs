@@ -40,18 +40,24 @@ const inbound = (id, from, body) =>
   } }] }] });
 
 // --- mock server: xAI /chat/completions + Graph /messages -------------------
-let chatHits = 0, metaHits = 0, lastChat = null, lastMeta = null, n = 0;
+let chatHits = 0, metaHits = 0, typingHits = 0, lastChat = null, lastMeta = null, lastTyping = null, n = 0;
 const mock = http.createServer((req, res) => {
   let data = "";
   req.on("data", (c) => (data += c));
   req.on("end", () => {
-    if (req.url === "/stats") { res.end(JSON.stringify({ chatHits, metaHits, lastChat, lastMeta })); return; }
+    if (req.url === "/stats") { res.end(JSON.stringify({ chatHits, metaHits, typingHits, lastChat, lastMeta, lastTyping })); return; }
     if (req.url.includes("/chat/completions")) {
       chatHits++; lastChat = JSON.parse(data || "{}");
       res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: `grok reply ${++n}` } }] }));
       return;
     }
-    if (req.url.includes("/messages")) { metaHits++; lastMeta = JSON.parse(data || "{}"); res.end(JSON.stringify({ messages: [{ id: "wamid.test" }] })); return; }
+    if (req.url.includes("/messages")) {
+      const b = JSON.parse(data || "{}");
+      if (b.status === "read") { typingHits++; lastTyping = b; } // read receipt + typing indicator
+      else { metaHits++; lastMeta = b; }                         // actual reply
+      res.end(JSON.stringify({ messages: [{ id: "wamid.test" }] }));
+      return;
+    }
     res.writeHead(404); res.end("{}");
   });
 });
@@ -101,6 +107,8 @@ async function main() {
     let s = await stats();
     eq("xAI called once", s.chatHits - s0.chatHits, 1);
     eq("reply sent to Meta once", s.metaHits - s0.metaHits, 1);
+    eq("typing indicator + read receipt sent", s.typingHits - s0.typingHits, 1);
+    eq("typing references the incoming message id", s.lastTyping.message_id, "itest.a1");
     eq("Gilfoyle system prompt sent", s.lastChat.messages[0].role === "system" && /Gilfoyle/.test(s.lastChat.messages[0].content), true);
     eq("model from env used", s.lastChat.model, "test-grok");
     eq("Meta got grok's reply text", /grok reply/.test(s.lastMeta.text.body), true);

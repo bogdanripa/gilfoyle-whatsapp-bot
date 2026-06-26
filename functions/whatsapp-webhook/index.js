@@ -134,6 +134,30 @@ async function grokReply(history, userText) {
   return text;
 }
 
+// Mark the incoming message read and show a "typing…" indicator while we think.
+// Same /messages endpoint; auto-dismisses when we send the reply or after ~25s.
+// Best-effort — never let this block or fail the actual reply.
+async function markReadWithTyping(messageId) {
+  try {
+    await timedFetch(
+      `${GRAPH_API_BASE}/${GRAPH_API_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messaging_product: "whatsapp",
+          status: "read",
+          message_id: messageId,
+          typing_indicator: { type: "text" },
+        }),
+      },
+      10000
+    );
+  } catch (err) {
+    console.error("typing indicator failed:", err.message || err);
+  }
+}
+
 async function sendToMeta(to, text) {
   const r = await timedFetch(
     `${GRAPH_API_BASE}/${GRAPH_API_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages`,
@@ -192,6 +216,8 @@ functions.http("whatsapp", async (req, res) => {
         msg.type === "text"
           ? msg.text.body
           : `[they sent a ${msg.type}, not text — react to that]`;
+
+      await markReadWithTyping(msg.id); // read receipt + "typing…" while Grok thinks
 
       const history = await readHistory(from);
       try {
