@@ -24,6 +24,7 @@ const {
   WHATSAPP_PHONE_NUMBER_ID, // Cloud API phone number id (NOT the display number)
   XAI_API_KEY,              // xAI API key
   XAI_MODEL = "grok-4.3",   // cheapest model that supports the Responses API — verify in console
+  XAI_TEMPERATURE = "1.1",  // higher = more varied/unhinged replies (0–2)
   XAI_BASE_URL = "https://api.x.ai/v1",
   GRAPH_API_VERSION = "v22.0",
   GRAPH_API_BASE = "https://graph.facebook.com", // overridable for local testing
@@ -42,11 +43,12 @@ const PERSONA =
     "every message. Stay just as rude and sweary in whatever language they use.";
 
 const MAX_HISTORY = 100;              // messages stored per conversation (self-pruning)
-const CHAT_CONTEXT = 20;              // recent messages actually sent to the model (token cost)
+const CHAT_CONTEXT = MAX_HISTORY;    // send the whole stored history so Grok has full context
 const CONV_TTL_MS = 90 * 86_400_000;
 const CLAIM_LEASE_MS = 120_000;
 const DEDUPE_TTL_MS = 7 * 86_400_000;
 const dailyCap = Number(DAILY_CAP) || 0;
+const xaiTemperature = Number(XAI_TEMPERATURE) || 1.1;
 
 // Re-engagement poke: the hourly cron messages anyone whose last inbound is in this
 // window — late enough to feel like Gilfoyle got impatient, but still INSIDE the
@@ -139,17 +141,22 @@ function timedFetch(url, opts, ms = 20000) {
   return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(t));
 }
 
-async function grokReply(history, userText, instruction) {
-  const messages = [
-    { role: "system", content: PERSONA },
-    ...history.slice(-CHAT_CONTEXT).map((m) => ({ role: m.role, content: m.text })),
-  ];
+async function grokReply(history, userText, { name, instruction } = {}) {
+  const messages = [{ role: "system", content: PERSONA }];
+  if (name) {
+    messages.push({
+      role: "system",
+      content: `The person you're talking to shows up on WhatsApp as "${name}". ` +
+        `Use their name to mock them whenever it lands.`,
+    });
+  }
+  messages.push(...history.slice(-CHAT_CONTEXT).map((m) => ({ role: m.role, content: m.text })));
   if (instruction) messages.push({ role: "system", content: instruction });
   if (userText) messages.push({ role: "user", content: userText });
   const r = await timedFetch(`${XAI_BASE_URL}/chat/completions`, {
     method: "POST",
     headers: { Authorization: `Bearer ${XAI_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: XAI_MODEL, messages, max_tokens: 200, temperature: 0.9 }),
+    body: JSON.stringify({ model: XAI_MODEL, messages, max_tokens: 200, temperature: xaiTemperature }),
   });
   const body = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(`xai ${r.status}: ${JSON.stringify(body)}`);
@@ -226,7 +233,7 @@ async function runPokeSweep() {
     if (hours < POKE_MIN_HOURS || hours >= POKE_MAX_HOURS) continue; // outside the poke band
     if ((d.lastPokeTs || 0) >= lastTs) continue;                     // already poked this window
     try {
-      const reply = await grokReply(messages, null, POKE_INSTRUCTION);
+      const reply = await grokReply(messages, null, { name: d.name, instruction: POKE_INSTRUCTION });
       await sendToMeta(doc.id, reply);
       await appendMessages(doc.id, [{ role: "assistant", text: reply }], { lastPokeTs: now });
       poked++;
@@ -263,6 +270,7 @@ functions.http("whatsapp", async (req, res) => {
   const value = req.body?.entry?.[0]?.changes?.[0]?.value;
   const messages = value?.messages;
   if (!messages?.length) return res.sendStatus(200); // delivery/read status callbacks etc.
+  const profileName = value?.contacts?.[0]?.profile?.name || null; // WhatsApp display name
 
   try {
     for (const msg of messages) {
@@ -283,12 +291,13 @@ functions.http("whatsapp", async (req, res) => {
 
       const history = await readHistory(from);
       try {
-        const reply = await grokReply(history, body);
+        const reply = await grokReply(history, body, { name: profileName });
         await sendToMeta(from, reply);
-        await appendMessages(from, [
-          { role: "user", text: body },
-          { role: "assistant", text: reply },
-        ]);
+        await appendMessages(
+          from,
+          [{ role: "user", text: body }, { role: "assistant", text: reply }],
+          profileName ? { name: profileName } : {}
+        );
         await markProcessed(msg.id);
       } catch (err) {
         await releaseClaim(msg.id); // let Meta's retry re-process

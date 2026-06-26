@@ -130,6 +130,8 @@ async function main() {
     eq("typing references the incoming message id", s.lastTyping.message_id, "itest.a1");
     eq("Gilfoyle system prompt sent", s.lastChat.messages[0].role === "system" && /Gilfoyle/.test(s.lastChat.messages[0].content), true);
     eq("model from env used", s.lastChat.model, "test-grok");
+    eq("WhatsApp name passed into context", s.lastChat.messages.some((m) => m.role === "system" && /"Tester"/.test(m.content)), true);
+    eq("full-context temperature applied (>1)", s.lastChat.temperature > 1, true);
     eq("Meta got grok's reply text", /grok reply/.test(s.lastMeta.text.body), true);
 
     // dedupe replay
