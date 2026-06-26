@@ -57,16 +57,16 @@ async function seed() {
   await db.collection("modes").doc("test-eugene").set({ enabled: true, fireUrl: `http://127.0.0.1:${MOCK_PORT}/fire`, token: "tok-eug", rateLimitPerDay: 2, persona: "You are Eugene.", rateLimitMessage: "ttyl" });
   await db.collection("users").doc(WORK_WA).set({ mode: "test-work" });
 }
+const DEDUPE_IDS = ["itest.w1", "itest.w2", "itest.e1", "itest.e2", "itest.e3", "itest.e4"];
 async function cleanup() {
   const dels = [
     db.collection("modes").doc("test-work"), db.collection("modes").doc("test-eugene"),
     db.collection("users").doc(WORK_WA),
     db.collection("conversations").doc(WORK_WA), db.collection("conversations").doc(EUG_WA),
     db.collection("ratelimit").doc(EUG_WA),
+    ...DEDUPE_IDS.map((id) => db.collection("wa_dedupe").doc(id)),
   ];
   for (const d of dels) await d.delete().catch(() => {});
-  const dq = await db.collection("wa_dedupe").where("__name__", ">=", db.doc("wa_dedupe/itest.")).where("__name__", "<", db.doc("wa_dedupe/itest/")).get().catch(() => null);
-  if (dq) for (const doc of dq.docs) await doc.ref.delete().catch(() => {});
 }
 const stats = async () => (await fetch(`http://127.0.0.1:${MOCK_PORT}/stats`)).json();
 
