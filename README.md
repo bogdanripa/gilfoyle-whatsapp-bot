@@ -38,6 +38,9 @@ just a per-token API call to Grok.
   double-replies.
 - **Daily cap** — `DAILY_CAP` messages/sender/day (default 200) so nobody runs up the
   Grok bill by arguing with it for 75 minutes (looking at you, original MGonz victim).
+- **Re-engagement poke** — an hourly Cloud Scheduler cron messages anyone who's gone
+  quiet for ~23 hours (still inside the 24h window, so no template needed). Gilfoyle
+  doesn't let you ghost him.
 
 ## Repo
 

@@ -30,6 +30,7 @@ PID=whatsapp-asst-bripa
 printf '%s' 'PASTE_META_APP_SECRET' | gcloud secrets create wa-app-secret --data-file=- --project=$PID
 printf '%s' 'PASTE_WHATSAPP_TOKEN' | gcloud secrets create wa-token      --data-file=- --project=$PID
 printf '%s' 'PASTE_XAI_API_KEY'    | gcloud secrets create xai-key       --data-file=- --project=$PID
+printf '%s' "$(openssl rand -hex 24)" | gcloud secrets create cron-secret --data-file=- --project=$PID
 ```
 
 ## 3. Deploy
@@ -42,10 +43,11 @@ gcloud functions deploy whatsapp-webhook \
   --trigger-http --allow-unauthenticated \
   --project=whatsapp-asst-bripa \
   --set-env-vars VERIFY_TOKEN=PICK_A_RANDOM_STRING,WHATSAPP_PHONE_NUMBER_ID=PASTE_PHONE_NUMBER_ID,XAI_MODEL=grok-4.3,DAILY_CAP=200 \
-  --set-secrets APP_SECRET=wa-app-secret:latest,WHATSAPP_TOKEN=wa-token:latest,XAI_API_KEY=xai-key:latest
+  --set-secrets APP_SECRET=wa-app-secret:latest,WHATSAPP_TOKEN=wa-token:latest,XAI_API_KEY=xai-key:latest,CRON_SECRET=cron-secret:latest
 ```
 
-`--allow-unauthenticated` is required (Meta calls publicly); the HMAC signature check secures it.
+`--allow-unauthenticated` is required (Meta calls publicly); the HMAC signature check secures
+the webhook and `CRON_SECRET` secures `/cron`.
 
 ## 4. Grant the runtime SA Firestore + Secret access
 
@@ -67,7 +69,22 @@ Meta App → WhatsApp → Configuration → Webhook:
 - Verify token = the same string you set for `VERIFY_TOKEN` above (generate one with `openssl rand -hex 24`)
 - Subscribe to the **messages** field
 
-## 6. Confirm
+## 6. Hourly re-engagement cron (free)
+
+Cloud Scheduler (free tier: 3 jobs/month) hits `/cron` every hour; the function pokes
+anyone whose last message is 23–24h old — still inside the 24h window, so it's free-form.
+
+```bash
+PID=whatsapp-asst-bripa
+gcloud services enable cloudscheduler.googleapis.com --project=$PID
+CRON_SECRET=$(gcloud secrets versions access latest --secret=cron-secret --project=$PID)
+gcloud scheduler jobs create http gilfoyle-hourly-poke \
+  --location=europe-central2 --schedule="0 * * * *" --time-zone="Europe/Bucharest" \
+  --uri="$(gcloud functions describe whatsapp-webhook --region=europe-central2 --project=$PID --format='value(url)')/cron" \
+  --http-method=POST --headers="x-cron-secret=$CRON_SECRET" --attempt-deadline=120s --project=$PID
+```
+
+## 7. Confirm
 Message the WhatsApp Business number → Grok-as-Gilfoyle insults you back.
 Logs: `gcloud functions logs read whatsapp-webhook --region=europe-central2 --project=whatsapp-asst-bripa --limit=50`
 

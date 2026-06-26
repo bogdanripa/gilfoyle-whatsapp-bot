@@ -54,6 +54,17 @@ costs xAI tokens. `ratelimit/{wa_id}` `{day,count}` caps answers per wa_id per U
 (`DAILY_CAP`, default 200; set `0` to disable). Over the cap → silent (no model call,
 no send). This bounds runaway spend without a hard product ceiling.
 
+## Re-engagement poke (hourly cron)
+
+Cloud Scheduler (free tier) POSTs `/cron` every hour. The function pokes every
+conversation whose last inbound message is **23–24 hours** old and hasn't been poked
+this window (`lastPokeTs < lastInboundTs`): Grok writes an unprompted, impatient,
+hostile re-engagement line and sends it. The 23h timing is deliberate — it's still
+**inside the 24h customer-service window**, so the message is free-form (no template),
+and if the user bites, their reply resets the window for another round. Idempotent per
+window; guarded by `CRON_SECRET`. (Heads-up: poking people who went quiet can draw
+blocks/reports, which lower the number's WhatsApp quality rating.)
+
 ## Components
 
 - `functions/whatsapp-webhook/index.js` — the whole bot (verify / inbound / xAI / send).
