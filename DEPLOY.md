@@ -41,7 +41,7 @@ gcloud functions deploy whatsapp-webhook \
   --source=. --entry-point=whatsapp \
   --trigger-http --allow-unauthenticated \
   --project=whatsapp-asst-bripa \
-  --set-env-vars VERIFY_TOKEN=860e10b0a439082a3e36df8ea8e6690bf61d236ad26c45c5,WHATSAPP_PHONE_NUMBER_ID=PASTE_PHONE_NUMBER_ID,XAI_MODEL=grok-4.3,DAILY_CAP=200 \
+  --set-env-vars VERIFY_TOKEN=PICK_A_RANDOM_STRING,WHATSAPP_PHONE_NUMBER_ID=PASTE_PHONE_NUMBER_ID,XAI_MODEL=grok-4.3,DAILY_CAP=200 \
   --set-secrets APP_SECRET=wa-app-secret:latest,WHATSAPP_TOKEN=wa-token:latest,XAI_API_KEY=xai-key:latest
 ```
 
@@ -64,7 +64,7 @@ gcloud functions describe whatsapp-webhook --region=europe-central2 --project=wh
 ```
 Meta App → WhatsApp → Configuration → Webhook:
 - Callback URL = that URL
-- Verify token = `860e10b0a439082a3e36df8ea8e6690bf61d236ad26c45c5`
+- Verify token = the same string you set for `VERIFY_TOKEN` above (generate one with `openssl rand -hex 24`)
 - Subscribe to the **messages** field
 
 ## 6. Confirm
@@ -73,6 +73,7 @@ Logs: `gcloud functions logs read whatsapp-webhook --region=europe-central2 --pr
 
 ## Values still needed from you
 `APP_SECRET`, `WHATSAPP_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID` (Meta), and `XAI_API_KEY` (xAI console).
-`VERIFY_TOKEN` is pre-generated above. `XAI_MODEL` defaults to `grok-4.3` — the cheapest
-model that supports the Responses API (`previous_response_id`); the absolute-cheapest
-`grok-build-0.1` does not. Confirm the exact id in your xAI console.
+`VERIFY_TOKEN` is any string you choose (it must match what you enter in the Meta webhook
+config). `XAI_MODEL` defaults to `grok-4.3` — the cheapest model that supports the Responses
+API (`previous_response_id`); the absolute-cheapest `grok-build-0.1` does not. Confirm the
+exact id in your xAI console.
