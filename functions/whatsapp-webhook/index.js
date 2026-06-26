@@ -22,7 +22,7 @@ const {
   WHATSAPP_TOKEN,           // Meta Cloud API token — used to send replies
   WHATSAPP_PHONE_NUMBER_ID, // Cloud API phone number id (NOT the display number)
   XAI_API_KEY,              // xAI API key
-  XAI_MODEL = "grok-4.3",   // xAI model id — verify against https://docs.x.ai/docs/models
+  XAI_MODEL = "grok-build-0.1", // cheapest chat model per docs — verify id in the xAI console
   XAI_BASE_URL = "https://api.x.ai/v1",
   GRAPH_API_VERSION = "v22.0",
   GRAPH_API_BASE = "https://graph.facebook.com", // overridable for local testing
