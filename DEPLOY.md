@@ -7,6 +7,12 @@ Infra already set up (2026-06-26):
 
 See [DESIGN.md](DESIGN.md) for the architecture.
 
+> **CI/CD:** deploys are automatic — pushing to `main` any change under
+> `functions/whatsapp-webhook/**` runs `.github/workflows/deploy.yml`, which redeploys
+> the function. Deploy config lives in GitHub Actions secrets (`GCP_SA_KEY`,
+> `WA_VERIFY_TOKEN`, `WA_PHONE_NUMBER_ID`); app secrets stay in GCP Secret Manager. The
+> manual `gcloud` steps below are only for first-time infra setup.
+
 ## Config
 
 **Function env:** `VERIFY_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `XAI_MODEL` (optional,

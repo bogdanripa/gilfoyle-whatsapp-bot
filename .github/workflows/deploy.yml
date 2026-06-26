@@ -1,0 +1,39 @@
+name: Deploy function
+
+# Redeploy the Cloud Function on every push to main that touches the function
+# source (or this workflow). Manual runs available via the Actions tab.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "functions/whatsapp-webhook/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+# One deploy at a time; cancel an in-flight deploy if a newer commit lands.
+concurrency:
+  group: deploy-whatsapp-webhook
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy whatsapp-webhook
+        run: |
+          gcloud functions deploy whatsapp-webhook \
+            --gen2 --runtime=nodejs22 --region=europe-central2 \
+            --source=functions/whatsapp-webhook --entry-point=whatsapp \
+            --trigger-http --allow-unauthenticated \
+            --project=whatsapp-asst-bripa \
+            --set-env-vars "VERIFY_TOKEN=${{ secrets.WA_VERIFY_TOKEN }},WHATSAPP_PHONE_NUMBER_ID=${{ secrets.WA_PHONE_NUMBER_ID }},XAI_MODEL=grok-4.3,XAI_TEMPERATURE=1.1,DAILY_CAP=200" \
+            --set-secrets "APP_SECRET=wa-app-secret:latest,WHATSAPP_TOKEN=wa-token:latest,XAI_API_KEY=xai-key:latest,CRON_SECRET=cron-secret:latest"
