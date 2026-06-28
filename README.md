@@ -33,7 +33,10 @@ just a per-token API call to Grok.
   Romanian out), just as rude.
 - **Read receipt + typing indicator** — it reads you, then makes you watch it "think"
   before insulting you. Sells the illusion.
-- **Conversation memory** — last 100 turns per chat (self-pruning, 90-day TTL in Firestore).
+- **Images & voice** — send a photo (or several at once, with a caption) and it reads them
+  via Grok vision; send a voice note and it transcribes via Grok speech-to-text. Either way
+  the reply is text, just as rude.
+- **Conversation memory** — last 5 messages per chat (self-pruning, 90-day TTL in Firestore).
 - **`/clear` command** — send `/clear` to wipe the current chat's memory and start fresh
   (costs no Grok tokens; works even when over the daily cap).
 - **Dedupe** — Meta delivers webhooks at-least-once; a doc per `message.id` prevents

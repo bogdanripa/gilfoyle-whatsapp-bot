@@ -18,7 +18,9 @@ See [DESIGN.md](DESIGN.md) for the architecture.
 **Function env:** `VERIFY_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `XAI_MODEL` (optional,
 default `grok-4-1-fast`), `DAILY_CAP` (optional, default 200; `0` = unlimited),
 `SYSTEM_PROMPT` (optional override), `CLEAR_COMMAND` (optional, default `/clear`),
-`CLEAR_REPLY` (optional, ack sent after a memory wipe).
+`CLEAR_REPLY` (optional, ack sent after a memory wipe), `XAI_VISION_MODEL` (optional,
+defaults to `XAI_MODEL` — model used for image messages), `XAI_STT_MODEL` (optional,
+default `grok-stt` — voice transcription).
 **Function secrets:** `APP_SECRET`, `WHATSAPP_TOKEN`, `XAI_API_KEY`.
 
 No routines, no skill, no modes — the function talks to xAI and Meta directly.

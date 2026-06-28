@@ -9,6 +9,9 @@
 //   POST /      inbound messages (HMAC-signed by Meta) → xAI → reply
 //   POST /cron  hourly re-engagement sweep (Cloud Scheduler) → poke quiet users at ~23h
 //
+// Text, images (Grok vision) and voice notes (Grok speech-to-text) are all understood;
+// the reply is always text. Several images + a caption in one turn are read together.
+//
 // Firestore keeps per-conversation memory (so Gilfoyle holds a thread), at-least-once
 // dedupe, and an optional per-wa_id daily cap (a billing guardrail — the endpoint is
 // public, every reply costs xAI tokens).
@@ -33,7 +36,12 @@ const {
   CRON_SECRET,             // shared secret Cloud Scheduler presents to POST /cron
   CLEAR_COMMAND = "/clear", // inbound text that wipes this chat's memory
   CLEAR_REPLY = "memory wiped. who are you again?", // ack sent after a wipe
+  XAI_VISION_MODEL,         // model for image messages; defaults to XAI_MODEL (try the cheap one)
+  XAI_STT_MODEL = "grok-stt", // xAI speech-to-text model for voice messages
 } = process.env;
+
+// Images go through the same cheap model by default; override only if it can't see.
+const visionModel = XAI_VISION_MODEL || XAI_MODEL;
 
 const PERSONA =
   SYSTEM_PROMPT ||
@@ -69,7 +77,7 @@ const PERSONA =
     "reply sounds like you're finishing their bar. Keep it short and natural, stay rude, and " +
     "never reuse the same line twice.";
 
-const MAX_HISTORY = 100;              // messages stored per conversation (self-pruning)
+const MAX_HISTORY = 5;               // messages stored per conversation (self-pruning)
 const CHAT_CONTEXT = MAX_HISTORY;    // send the whole stored history so Grok has full context
 const CONV_TTL_MS = 90 * 86_400_000;
 const CLAIM_LEASE_MS = 120_000;
@@ -171,7 +179,40 @@ function timedFetch(url, opts, ms = 20000) {
   return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(t));
 }
 
-async function grokReply(history, userText, { name, instruction } = {}) {
+// Download a WhatsApp media object (image/audio) by its media id. Two hops: resolve the
+// short-lived CDN url from the Graph API, then fetch the bytes (both need the WA token).
+async function fetchMedia(mediaId) {
+  const metaRes = await timedFetch(
+    `${GRAPH_API_BASE}/${GRAPH_API_VERSION}/${mediaId}`,
+    { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } }
+  );
+  const meta = await metaRes.json().catch(() => ({}));
+  if (!metaRes.ok || !meta.url) throw new Error(`media meta ${metaRes.status}: ${JSON.stringify(meta)}`);
+  const binRes = await timedFetch(meta.url, { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } }, 30000);
+  if (!binRes.ok) throw new Error(`media download ${binRes.status}`);
+  const buffer = Buffer.from(await binRes.arrayBuffer());
+  return { buffer, mimeType: meta.mime_type || "application/octet-stream" };
+}
+
+// Transcribe a voice message via xAI's speech-to-text endpoint. Returns the text.
+async function transcribeAudio(buffer, mimeType) {
+  const ext = mimeType.includes("ogg") ? "ogg" : mimeType.includes("mpeg") ? "mp3"
+    : mimeType.includes("wav") ? "wav" : mimeType.includes("mp4") ? "mp4" : "audio";
+  const form = new FormData();
+  form.append("model", XAI_STT_MODEL);
+  form.append("format", "json");
+  form.append("file", new Blob([buffer], { type: mimeType }), `voice.${ext}`);
+  const r = await timedFetch(`${XAI_BASE_URL}/stt`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${XAI_API_KEY}` }, // no Content-Type: FormData sets the boundary
+    body: form,
+  }, 30000);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(`xai stt ${r.status}: ${JSON.stringify(body)}`);
+  return (body.text || body.transcript || "").trim();
+}
+
+async function grokReply(history, userText, { name, instruction, images = [], model } = {}) {
   const messages = [{ role: "system", content: PERSONA }];
   if (name) {
     messages.push({
@@ -184,11 +225,18 @@ async function grokReply(history, userText, { name, instruction } = {}) {
   }
   messages.push(...history.slice(-CHAT_CONTEXT).map((m) => ({ role: m.role, content: m.text })));
   if (instruction) messages.push({ role: "system", content: instruction });
-  if (userText) messages.push({ role: "user", content: userText });
+  if (images.length) {
+    // One user turn can carry several images plus the text/captions that came with them.
+    const content = [{ type: "text", text: userText || "[no caption]" }];
+    for (const url of images) content.push({ type: "image_url", image_url: { url } });
+    messages.push({ role: "user", content });
+  } else if (userText) {
+    messages.push({ role: "user", content: userText });
+  }
   const r = await timedFetch(`${XAI_BASE_URL}/chat/completions`, {
     method: "POST",
     headers: { Authorization: `Bearer ${XAI_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: XAI_MODEL, messages, max_tokens: 200, temperature: xaiTemperature }),
+    body: JSON.stringify({ model: model || XAI_MODEL, messages, max_tokens: 200, temperature: xaiTemperature }),
   });
   const body = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(`xai ${r.status}: ${JSON.stringify(body)}`);
@@ -304,50 +352,90 @@ functions.http("whatsapp", async (req, res) => {
   if (!messages?.length) return res.sendStatus(200); // delivery/read status callbacks etc.
   const profileName = value?.contacts?.[0]?.profile?.name || null; // WhatsApp display name
 
+  // A single webhook can carry several messages from the same sender (e.g. an album of
+  // images, or images + a caption). Group by sender so one batch = one combined turn =
+  // one reply, instead of replying once per image.
+  const bySender = new Map();
+  for (const msg of messages) {
+    if (!bySender.has(msg.from)) bySender.set(msg.from, []);
+    bySender.get(msg.from).push(msg);
+  }
+
   try {
-    for (const msg of messages) {
-      const from = msg.from;
-      if (!(await claimMessage(msg.id))) continue; // already handled / in-flight
+    for (const [from, msgs] of bySender) {
+      const claimed = [];
+      for (const m of msgs) if (await claimMessage(m.id)) claimed.push(m); // skip dupes / in-flight
+      if (!claimed.length) continue;
 
       // /clear command: wipe this chat's memory. Handled before the cap check so it
       // always works, and it never hits xAI (no token cost).
-      if (msg.type === "text" && msg.text.body.trim().toLowerCase() === CLEAR_COMMAND) {
+      const clearMsg = claimed.find(
+        (m) => m.type === "text" && m.text.body.trim().toLowerCase() === CLEAR_COMMAND
+      );
+      if (clearMsg) {
         await clearConversation(from);
-        await markReadWithTyping(msg.id);
+        await markReadWithTyping(clearMsg.id);
         try {
           await sendToMeta(from, CLEAR_REPLY);
-          await markProcessed(msg.id);
+          for (const m of claimed) await markProcessed(m.id);
         } catch (err) {
-          await releaseClaim(msg.id);
+          for (const m of claimed) await releaseClaim(m.id);
           throw err;
         }
         continue;
       }
 
       if (!(await underDailyCap(from))) {
-        await markProcessed(msg.id); // over cap → stay silent (don't burn xAI tokens)
+        for (const m of claimed) await markProcessed(m.id); // over cap → stay silent
         continue;
       }
 
-      const body =
-        msg.type === "text"
-          ? msg.text.body
-          : `[they sent a ${msg.type}, not text — react to that]`;
+      await markReadWithTyping(claimed[claimed.length - 1].id); // read + "typing…" up front
 
-      await markReadWithTyping(msg.id); // read receipt + "typing…" while Grok thinks
+      // Collect every part of the turn: text, image bytes, and transcribed voice.
+      const textParts = [];
+      const images = [];
+      let usedVision = false;
+      for (const m of claimed) {
+        try {
+          if (m.type === "text") {
+            textParts.push(m.text.body);
+          } else if (m.type === "image") {
+            const media = await fetchMedia(m.image.id);
+            images.push(`data:${media.mimeType};base64,${media.buffer.toString("base64")}`);
+            if (m.image.caption) textParts.push(m.image.caption);
+            usedVision = true;
+          } else if (m.type === "audio") {
+            const media = await fetchMedia(m.audio.id);
+            const transcript = await transcribeAudio(media.buffer, media.mimeType);
+            textParts.push(transcript || `[a voice message you couldn't make out — mock them for it]`);
+          } else {
+            textParts.push(`[they sent a ${m.type}, not text — react to that]`);
+          }
+        } catch (err) {
+          console.error("media handling failed:", err.message || err);
+          textParts.push(`[they sent a ${m.type} you couldn't open — mock them for it]`);
+        }
+      }
 
+      const userText = textParts.join("\n").trim();
       const history = await readHistory(from);
       try {
-        const reply = await grokReply(history, body, { name: profileName });
+        const reply = await grokReply(history, userText, {
+          name: profileName,
+          images,
+          model: usedVision ? visionModel : undefined,
+        });
         await sendToMeta(from, reply);
+        const tag = images.length ? `[${images.length} image${images.length > 1 ? "s" : ""}] ` : "";
         await appendMessages(
           from,
-          [{ role: "user", text: body }, { role: "assistant", text: reply }],
+          [{ role: "user", text: (tag + userText).trim() || "[media]" }, { role: "assistant", text: reply }],
           profileName ? { name: profileName } : {}
         );
-        await markProcessed(msg.id);
+        for (const m of claimed) await markProcessed(m.id);
       } catch (err) {
-        await releaseClaim(msg.id); // let Meta's retry re-process
+        for (const m of claimed) await releaseClaim(m.id); // let Meta's retry re-process
         throw err;
       }
     }
