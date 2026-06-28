@@ -25,7 +25,7 @@ xAI is OpenAI-compatible: `POST {XAI_BASE_URL}/chat/completions` with
 `Authorization: Bearer {XAI_API_KEY}`, body `{ model, messages:[{role,content}], … }`,
 reply at `choices[0].message.content`. Grok is used (over Claude) because it's far less
 likely to refuse the hostile persona. Model id is env-configurable (`XAI_MODEL`,
-default `grok-4.3`) — verify against https://docs.x.ai/docs/models.
+default `grok-4-1-fast`) — verify against https://docs.x.ai/docs/models.
 
 The persona is the system message (env `SYSTEM_PROMPT`, else the built-in Gilfoyle text).
 

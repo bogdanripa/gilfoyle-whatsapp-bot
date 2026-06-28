@@ -23,7 +23,7 @@ const {
   WHATSAPP_TOKEN,           // Meta Cloud API token — used to send replies
   WHATSAPP_PHONE_NUMBER_ID, // Cloud API phone number id (NOT the display number)
   XAI_API_KEY,              // xAI API key
-  XAI_MODEL = "grok-4.3",   // cheapest model that supports the Responses API — verify in console
+  XAI_MODEL = "grok-4-1-fast", // fast + cheap ($0.20/$0.50 per M) — ideal for short one-liners
   XAI_TEMPERATURE = "1.1",  // higher = more varied/unhinged replies (0–2)
   XAI_BASE_URL = "https://api.x.ai/v1",
   GRAPH_API_VERSION = "v22.0",
@@ -31,6 +31,8 @@ const {
   DAILY_CAP = "200",        // max messages answered per wa_id per UTC day; "0" = unlimited
   SYSTEM_PROMPT,            // optional override of the persona below
   CRON_SECRET,             // shared secret Cloud Scheduler presents to POST /cron
+  CLEAR_COMMAND = "/clear", // inbound text that wipes this chat's memory
+  CLEAR_REPLY = "memory wiped. who are you again?", // ack sent after a wipe
 } = process.env;
 
 const PERSONA =
@@ -135,6 +137,9 @@ async function appendMessages(convId, entries, extra = {}) {
     );
   });
 }
+
+// Wipe a chat's stored memory (history + poke state). Best-effort.
+const clearConversation = (convId) => conversations.doc(convId).delete().catch(() => {});
 
 // Timestamp of the most recent inbound (user) message — the anchor for the 24h window.
 function lastInboundTs(messages) {
@@ -303,6 +308,21 @@ functions.http("whatsapp", async (req, res) => {
     for (const msg of messages) {
       const from = msg.from;
       if (!(await claimMessage(msg.id))) continue; // already handled / in-flight
+
+      // /clear command: wipe this chat's memory. Handled before the cap check so it
+      // always works, and it never hits xAI (no token cost).
+      if (msg.type === "text" && msg.text.body.trim().toLowerCase() === CLEAR_COMMAND) {
+        await clearConversation(from);
+        await markReadWithTyping(msg.id);
+        try {
+          await sendToMeta(from, CLEAR_REPLY);
+          await markProcessed(msg.id);
+        } catch (err) {
+          await releaseClaim(msg.id);
+          throw err;
+        }
+        continue;
+      }
 
       if (!(await underDailyCap(from))) {
         await markProcessed(msg.id); // over cap → stay silent (don't burn xAI tokens)

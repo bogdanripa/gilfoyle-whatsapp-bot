@@ -35,5 +35,5 @@ jobs:
             --source=functions/whatsapp-webhook --entry-point=whatsapp \
             --trigger-http --allow-unauthenticated \
             --project=whatsapp-asst-bripa \
-            --set-env-vars "VERIFY_TOKEN=${{ secrets.WA_VERIFY_TOKEN }},WHATSAPP_PHONE_NUMBER_ID=${{ secrets.WA_PHONE_NUMBER_ID }},XAI_MODEL=grok-4.3,XAI_TEMPERATURE=1.1,DAILY_CAP=200" \
+            --set-env-vars "VERIFY_TOKEN=${{ secrets.WA_VERIFY_TOKEN }},WHATSAPP_PHONE_NUMBER_ID=${{ secrets.WA_PHONE_NUMBER_ID }},XAI_MODEL=grok-4-1-fast,XAI_TEMPERATURE=1.1,DAILY_CAP=200" \
             --set-secrets "APP_SECRET=wa-app-secret:latest,WHATSAPP_TOKEN=wa-token:latest,XAI_API_KEY=xai-key:latest,CRON_SECRET=cron-secret:latest"

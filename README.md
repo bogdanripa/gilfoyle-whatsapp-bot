@@ -34,6 +34,8 @@ just a per-token API call to Grok.
 - **Read receipt + typing indicator** — it reads you, then makes you watch it "think"
   before insulting you. Sells the illusion.
 - **Conversation memory** — last 100 turns per chat (self-pruning, 90-day TTL in Firestore).
+- **`/clear` command** — send `/clear` to wipe the current chat's memory and start fresh
+  (costs no Grok tokens; works even when over the daily cap).
 - **Dedupe** — Meta delivers webhooks at-least-once; a doc per `message.id` prevents
   double-replies.
 - **Daily cap** — `DAILY_CAP` messages/sender/day (default 200) so nobody runs up the

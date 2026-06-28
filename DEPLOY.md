@@ -16,8 +16,9 @@ See [DESIGN.md](DESIGN.md) for the architecture.
 ## Config
 
 **Function env:** `VERIFY_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `XAI_MODEL` (optional,
-default `grok-4.3`), `DAILY_CAP` (optional, default 200; `0` = unlimited),
-`SYSTEM_PROMPT` (optional override).
+default `grok-4-1-fast`), `DAILY_CAP` (optional, default 200; `0` = unlimited),
+`SYSTEM_PROMPT` (optional override), `CLEAR_COMMAND` (optional, default `/clear`),
+`CLEAR_REPLY` (optional, ack sent after a memory wipe).
 **Function secrets:** `APP_SECRET`, `WHATSAPP_TOKEN`, `XAI_API_KEY`.
 
 No routines, no skill, no modes — the function talks to xAI and Meta directly.
@@ -48,7 +49,7 @@ gcloud functions deploy whatsapp-webhook \
   --source=. --entry-point=whatsapp \
   --trigger-http --allow-unauthenticated \
   --project=whatsapp-asst-bripa \
-  --set-env-vars VERIFY_TOKEN=PICK_A_RANDOM_STRING,WHATSAPP_PHONE_NUMBER_ID=PASTE_PHONE_NUMBER_ID,XAI_MODEL=grok-4.3,DAILY_CAP=200 \
+  --set-env-vars VERIFY_TOKEN=PICK_A_RANDOM_STRING,WHATSAPP_PHONE_NUMBER_ID=PASTE_PHONE_NUMBER_ID,XAI_MODEL=grok-4-1-fast,DAILY_CAP=200 \
   --set-secrets APP_SECRET=wa-app-secret:latest,WHATSAPP_TOKEN=wa-token:latest,XAI_API_KEY=xai-key:latest,CRON_SECRET=cron-secret:latest
 ```
 
@@ -97,6 +98,5 @@ Logs: `gcloud functions logs read whatsapp-webhook --region=europe-central2 --pr
 ## Values still needed from you
 `APP_SECRET`, `WHATSAPP_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID` (Meta), and `XAI_API_KEY` (xAI console).
 `VERIFY_TOKEN` is any string you choose (it must match what you enter in the Meta webhook
-config). `XAI_MODEL` defaults to `grok-4.3` — the cheapest model that supports the Responses
-API (`previous_response_id`); the absolute-cheapest `grok-build-0.1` does not. Confirm the
-exact id in your xAI console.
+config). `XAI_MODEL` defaults to `grok-4-1-fast` — fast and cheap (~$0.20/$0.50 per M
+tokens), a good fit for short one-liners. Confirm the exact id in your xAI console.
